@@ -1,0 +1,32 @@
+# ===== Keil MDK 编译产物（不上传，可重新编译生成）=====
+# 注意用 **/ 前缀：本仓库按阶段分子目录（00-blink/、01-uart/），
+# 不带 **/ 的规则只匹配仓库根目录，子目录里的产物就漏出来了。
+**/MDK-ARM/Template/
+**/MDK-ARM/Objects/
+**/MDK-ARM/Listings/
+*.o
+*.axf
+*.hex
+*.map
+*.crf
+*.d
+*.lnp
+*.sct
+*.dep
+*.iex
+*.build_log.htm
+*.htm
+*.lst
+
+# ===== HAL 库（从 CubeMX 固件包重新生成，不入库）=====
+# 无前导斜杠，自动匹配任意层级的 Drivers 目录
+Drivers/
+
+# ===== Keil 用户界面状态（个人化，不影响编译）=====
+*.uvguix.*
+
+# ===== 系统临时文件 =====
+Thumbs.db
+.DS_Store
+*.bak
+*.tmp
