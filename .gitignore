@@ -30,3 +30,6 @@ Thumbs.db
 .DS_Store
 *.bak
 *.tmp
+
+# ===== 编译日志（命令行 UV4 -o 生成的）=====
+*.log

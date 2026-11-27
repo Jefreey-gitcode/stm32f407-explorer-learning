@@ -12,8 +12,9 @@
 | `00-blink/` | 0 | CubeMX 最小模板 + LED 闪烁（干净基线） | ✅ 已验证 |
 | `01-uart/` | 1 | USART1 双向通信：printf 重定向 + IDLE/DMA 不定长接收 + 命令解析 | ✅ 已验证 |
 | `02-exti/` | 2 | 4 键外部中断：EXTI 事件 + 状态去重消抖 + 事件队列 + LED 状态镜像 | ✅ 已验证 |
+| `03-timer/` | 3 | TIM6 5ms 时基 + TIM14_CH1/PF9 PWM 呼吸灯 + 按键改采样状态机（长按/连发） | ✅ 已验证 |
 
-三个子目录内部的布局完全一致（`Src/` `Inc/` `MDK-ARM/` `Template.ioc`），
+四个子目录内部的布局完全一致（`Src/` `Inc/` `MDK-ARM/` `Template.ioc`），
 所以从一个阶段迁移到下一个阶段时，路径和工程配置都不用改。
 
 ## 环境与工具链
@@ -230,15 +231,101 @@ while (1)
 - 多键交叉按住松开：事件顺序与操作顺序一致，LED 状态不互相抵消
 - 按住 KEY0 时串口连发 `help` 10 次：全部正常返回，不卡死
 
-### 本阶段的欠债（等阶段 3 有了定时器再还）
+### 本阶段的欠债（阶段 3 已全部还清，见下节）
 
 | 欠的 | 什么时候还 |
 |---|---|
-| 长按 / 双击 / 连发 | 阶段 3：需要 5ms 采样 + 状态机，边沿中断做不出来 |
-| 严格消抖（按住期间的抖动） | 阶段 3：改成"连续 3 次采样一致" |
-| 队列临界区保护 | 阶段 3：有定时器后才会出现跨优先级写队列 |
-| `fputc` 改寄存器直写 | 阶段 3：这样即使误在 ISR 里 printf 也不会死锁 |
-| EXTI 优先级 0 → 2 | 阶段 3：和定时器优先级一起梳理 |
+| 长按 / 双击 / 连发 | ✅ 阶段 3 已还：长按 + 连发实现；双击明确推迟到阶段 5（需要 UI 交互才值得付 300ms 延迟） |
+| 严格消抖（按住期间的抖动） | ✅ 阶段 3 已还：改成"连续 3 次采样一致" |
+| 队列临界区保护 | ⚠️ 阶段 3 降级处理：改纯采样后生产者只剩一个，回到 SPSC 天然无竞争；但 PWM 的 CCR 写入需要临界区，已加在 `pwm_app.c` |
+| `fputc` 改寄存器直写 | ✅ 阶段 3 已还：`while(!(USART1->SR & USART_SR_TXE)); USART1->DR = ch;` |
+| EXTI 优先级 0 → 2 | ✅ 阶段 3 已还：重排为 DMA/USART=1、TIM6=2、SysTick=15 |
+
+## 阶段 3：03-timer —— 定时器时基 + PWM 呼吸灯 + 按键状态机升级
+
+**目标**：理解"定时器"这个词的两种完全不同的用法，并借此把按键从边沿方案升级到采样方案。
+
+### 两个定时器，两个方向
+
+| 用途 | 定时器 | 参数 | CPU 参与度 |
+|---|---|---|---|
+| 5ms 时基 | **TIM6**（基本定时器，无输出通道，不绑引脚） | PSC=83, ARR=4999 → 84MHz/84/5000 = **200Hz = 5ms** | 每 5ms 一次中断，约占 0.06% |
+| PWM 波形 | **TIM14_CH1 → PF9**（AF9） | PSC=83, ARR=499 → 84MHz/84/500 = **2kHz** | **全程不参与**，配好参数就由硬件产生方波 |
+
+一句话区分：**需要"定时做事"用 tick 中断，需要"持续输出波形"用硬件 PWM。**
+
+### CubeMX 里具体做了什么
+
+| # | 界面路径 | 操作 |
+|---|---|---|
+| 1 | Pinout 点 PF9 | 改成 `TIM14_CH1`，**并把 User Label `LED0` 清空** |
+| 2 | Timers → TIM14 | Activated，Channel1 = PWM Generation CH1，PSC=83，ARR=499，Pulse=0，**CH Polarity = Low**，Output compare preload = Enable |
+| 3 | Timers → TIM6 | Activated，PSC=83，ARR=4999 |
+| 4 | 四个按键 | Signal 从 `GPXTI2/3/4/0` 改成 **`GPIO_Input`**，Pull 和 Label 不变 |
+| 5 | NVIC | TIM6 global interrupt 勾选、优先级 **2**；DMA2_Stream2 和 USART1 改成 **1**；TIM14 不勾 |
+
+> **为什么必须清掉 `LED0` 标签**：标签留着，`main.h` 还会生成 `LED0_Pin`，那么误写 PF9 的代码照样编译通过，bug 藏到运行时。清空后 `key_app.h` 里那句 `#ifdef LED0_Pin #error` 就能把它拦在编译期。
+
+> **极性为什么是 Low**：DS0 低电平点亮，所以 `CCR/500` 是**低电平占比**。`CCR=0` → 引脚恒高 → 灭；`CCR=500` → 恒低 → 最亮。
+
+### 改动清单
+
+| 文件 | 改了什么 |
+|---|---|
+| **`Core-User/tick_app.c`** + `.h` | **新增**：启动 TIM6，覆盖 `HAL_TIM_PeriodElapsedCallback`，每 5ms 调按键扫描和 PWM 步进 |
+| **`Core-User/pwm_app.c`** + `.h` | **新增**：PWM 启动、呼吸步进（10ms 一步、上限 60%）、`PWM_SetDutyPercent()` 接口 |
+| **`Core-User/key_app.c`** + `.h` | **重写**：删掉 EXTI 回调，改成 `Key_Scan5ms()` 采样状态机；事件从 2 种扩到 4 种 |
+| `Core-User/uart_app.c` | 加命令分词、`pwm` 命令；`fputc` 改寄存器直写 |
+| `Src/main.c` | USER CODE 2 新初始化顺序：UART → PWM（闪一下）→ `PWM_SetModeAuto()` → KEY → TICK |
+| `MDK-ARM/Template.uvprojx` | `User_App` 组加 `tick_app.c`、`pwm_app.c` |
+
+### 按键：从边沿到采样，到底改了什么
+
+| | 阶段 2（边沿） | 阶段 3（采样） |
+|---|---|---|
+| 触发 | EXTI 中断，0ms 响应 | 每 5ms 读一次引脚 |
+| 消抖 | 状态去重 + 50ms 拒绝窗 | **连续 3 次一致（15ms）** |
+| 能识别的事件 | DOWN / UP | DOWN / UP / **LONG** / **REPEAT** |
+| 长处 | 快；空闲零 CPU | 能拿"按住多久"；多事件共用一套计数器 |
+| 短处 | 拿不到按住时长 → 做不出长按 | 固定 15ms 确认延迟 |
+
+**用 15ms 换确定性，是升级不是退步。** 四种主流开源按键库（MultiButton / FlexibleButton / easy_button / lwbtn）全部是采样方案，没有一个是纯边沿。
+
+参数：消抖 15ms、长按 800ms、连发 100ms。
+
+### 主循环契约（不变）
+
+```c
+while (1)
+{
+    Key_Process();        /* 非阻塞 */
+    UART_App_Process();   /* 非阻塞 */
+    HAL_Delay(1);
+}
+```
+
+### 串口命令（新增 pwm）
+
+| 命令 | 行为 |
+|---|---|
+| `pwm <0-100>` | 设固定占空比，呼吸停止 |
+| `pwm auto` | 恢复呼吸（从当前亮度继续） |
+| `pwm` | 查询当前模式和占空比 |
+
+### 验收标准
+
+- 复位出现三条横幅；DS0 呼吸约 6 秒一个来回；DS1 空闲 1Hz 心跳、按住任一键常亮
+- 按住任一键：DOWN → 800ms 后 LONG → 每 100ms 一条 REPEAT → 松手 UP
+- `pwm 50` 后灯固定中等亮度；`pwm 101` / `pwm abc` 报错且不改状态
+- 呼吸中连发 `help`，全部完整返回且呼吸无顿挫（验证 PWM 不占 CPU）
+- 有万用表时：`pwm 50` 测 PF9 对 GND 应约 **1.65V**（极性 Low，所以是 1−0.5 倍）
+
+### 本阶段踩到的坑
+
+| 坑 | 现象 | 原因 |
+|---|---|---|
+| `PWM_SetDutyPercent()` 会把模式切成 FIXED | 上电后 DS0 一直灭，发 `pwm auto` 才开始呼吸 | 启动指示用它闪了一下，之后没切回 AUTO |
+| PF9 的所有权 | 呼吸灯突然定住或灭掉 | 任何地方再 `HAL_GPIO_Init(PF9, GPIO_MODE_OUTPUT_PP)` 都会把 AF 改回普通输出 |
 
 ## 上传规则（`.gitignore` 取舍）
 
@@ -259,7 +346,7 @@ while (1)
 - [x] **阶段 0**：环境搭建 + 点灯 → `00-blink/`
 - [x] **阶段 1**：USART1 双向串口（IDLE + DMA）→ `01-uart/`
 - [x] **阶段 2**：EXTI 外部中断（按键 KEY0/KEY1/KEY2/WK_UP）→ `02-exti/`
-- [ ] **阶段 3**：定时器 / PWM（呼吸灯、舵机）
+- [x] **阶段 3**：定时器 / PWM（呼吸灯、按键状态机升级）→ `03-timer/`
 - [ ] **阶段 4**：DMA + ADC（多通道采样）
 - [ ] **阶段 5**：I2C / SPI（EEPROM、OLED、传感器）
 - [ ] **阶段 6**：FreeRTOS 多任务
